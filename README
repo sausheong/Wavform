@@ -1,0 +1,87 @@
+Generate MP3 waveforms with Ruby and R
+
+I blame Rully for this. If it wasn't for him I wouldn't have been obsessed with this and spent a good few hours at night figuring it out last week. It all started when Rully mentioned that he knew how many beeps there are in the Singapore MRT (subway system) 'doors closing' warning. There are 13 beeps, he explained and he said he found out by running a WAV recording of it through a MatLab package which in turn generated a waveform that allowed him to count the number of beeps accurately (it is normally too fast for the ear to determine the number of beeps). Naturally such talk triggered the inner competitive geek in me. I happened to be doing Ruby and R integration at the moment (watch out for my talk at RedDotRubyConf at the end of April) so I had no choice but to retrace his steps using my new toys.
+
+MP3 is a compressed and lossy audio encoding format and to generate a waveform I decided to convert it to WAV first. Doing this is relatively simple -- there is a library called icanhasaudio that wraps around LAME to encode and decode audio. Naturally you need to have LAME installed first in your machine before you can do this but once you have done that, decoding the MP3 is a breeze:
+
+[source language="ruby" autolinks="false"]
+reader = Audio::MPEG::Decoder.new
+File.open('mrt_closing.mp3', 'rb') do |input|
+  File.open('out.wav', 'wb')  do |output| 
+    reader.decode(input, output)
+  end
+end
+[/source]
+
+That was easy enough. The next step was a bit trickier though. To understand how to create a waveform from a WAV file let's digress a bit into what a WAV file is. WAV is an audio file format, originally from IBM and Microsoft, used to store audio bitstreams.WAV is an extended RIFF format, which is a little-endian version of the AIFF format (which is big-endian). In RIFF, data are stored in 'chunks' and for WAV, there are basically 2 types of chunks -- a format chunk and a sound data chunk. The format chunk contains the parameters describing the waveform for example its sample rate, and the data chunk contains the actual waveform data. There are other chunks but because I'm really only interested in the waveform I'll conveniently ignore them. This is how a minimal WAV file looks like:
+
+
+
+
+The data chunk has a chunk ID which is always 'data', and a chunk size that is a long integer. Data in the data chunk is stored in sample points. A sample point is a value that represents a sample of a sound at a given moment in time. Each sample point is stored as a linear 2's-complement value from 9 - 32 bits wide, specificed in the BitsPerSample field in the format chunk. Sounds in a WAV file can also come in multiple channels (for e.g. a stereo sound will come in 2 channels, like our file.) For such multi-channel sounds, the sample points are interleaved, one from each channel. A grouping of sample points for a single point in time for all the channels is called a sample frame. This graphic explains it best.
+
+
+If you open the WAV up with a hex editor it will look something like this:
+
+  
+I wouldn't go through the format chunks, in fact there is an easier way to find out the format, and that is for me to open up the WAV file using QuickTime and inspect it. 
+
+
+
+This is the information we found of the WAV file that we will use in a while:
+
+1. Format : Linear PCM
+2. Number of channels : 2
+3. Number of bits per sample : 16 
+
+In order to create the waveform, I opened up the WAV file, and collected each sample point from each channel and convert that sample point into an integer. This will be the data file I will use later in R to generate the waveform. Let's take a look at the code now that we use to generate the data:
+
+[source language="ruby" autolinks="false"]
+FasterCSV.open('wavdata.csv', 'w') do |csv|
+ csv << %w(ch1 ch2 combined)
+  File.open('out.wav') do |file|
+    while !file.eof?
+      if file.read(4) == 'data'
+        length = file.read(4).unpack('l').first
+        wavedata = StringIO.new file.read(length)
+        while !wavedata.eof? 
+          ch1, ch2 = wavedata.read(4).unpack('ss')
+          csv << [ch1, ch2,ch1+ch2]
+        end
+      end
+    end
+  end
+end
+[/source]
+
+Note that I didn't read the number of channels from the WAV file but instead assumed it has 2 channels (stereo), to simplify the code. Firstly I open up the WAV file. I ignored the format chunk completely and looked for the data chunk only. Then I read the length of the data chunk by reading the next 4 bytes and unpacking it as a long integer (hence 'l' format in the String#unpack method). This gives me the length of the data chunk that I will need to read next.
+
+Next, for ease of reading I wrap the returned data string in a StringIO object. As we found out earlier, each sample has 2 channels and each sample point has 16 bits, so we need to retrieve 32 bits or 4 bytes. Since each sample point has 16 bits, this means a short integer, so we unpack the 4 bytes that are read into 2 short integers, and this will give us the 2 sample points of 2 channels of that sample frame.
+
+After that it's a simple matter of stuffing the sample points into a CSV file.
+
+Finally, to generate the waveform from the data file, I run it through a simple R script, which I integrated with Ruby using the Ruby Rserve client.
+
+[source language="ruby" autolinks="false"]
+
+script=<<-EOF
+  png(file='/Users/sausheong/projects/wavform/mrtplot.png', height=800, width=600, res=72)
+  par(mfrow=c(3,1),cex=1.1)
+  wav_data <- read.csv(file='/Users/sausheong/projects/wavform/wavdata.csv', header=TRUE)
+  plot(wav_data$combined, type='n', main='Channel 1', xlab='Time', ylab='Frequency')
+  lines(wav_data$ch1)
+  plot(wav_data$combined, type='n', main='Channel 2', xlab='Time', ylab='Frequency')
+  lines(wav_data$ch2)
+  plot(wav_data$combined, type='n', main='Channel 1 + Channel 2', xlab='Time', ylab='Frequency')
+  lines(wav_data$combined)
+  dev.off()
+EOF
+Rserve::Connection.new.eval(script)
+
+[/source]
+
+The script generates the following PNG file:
+
+
+
+As you can see from the waveform (ignoring the first 2 bulges, which are 'doors' and 'closing' respectively) there are 13 sharp pointy shapes, which represent a beep each.
